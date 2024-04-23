@@ -1,0 +1,20 @@
+namespace
+
+enum ArchiveEntryType:byte {
+  File = 0,
+  EmptyFolder = 1,
+  EmptyFile = 2,
+}
+
+table AppendixEntry{
+    type: ArchiveEntryType;
+    offset: uint64;
+    size: uint64;
+    name: string;
+}
+
+table Appendix{
+    entries: [AppendixEntry];
+}
+
+root_type Appendix;
