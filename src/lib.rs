@@ -1,12 +1,12 @@
 mod appendix_generated;
+mod file_iter_helpers;
 
 use std::collections::HashMap;
 use crate::appendix_generated::{
   Appendix, AppendixArgs, AppendixEntry, AppendixEntryArgs, ArchiveEntryType,
 };
-use lzma::LzmaWriter;
 use std::fs;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 enum ArchiveInputEntryType {
@@ -73,54 +73,16 @@ impl ArchiveInputEntryDetails {
   }
 }
 
-fn compress_and_append<T>(
+fn compress_and_append(
   src: &Path,
-  dst: &impl Write,
+  dst: &mut impl Write,
   tmp_file_path: &Path,
 ) -> Result<usize, String> {
-  let write_len = match fs::File::open(src) {
-    Ok(mut fr) => {
-      let mut f_read_buffer = [0u8; 4 * 1024 * 1024];
-      match fs::File::create(tmp_file_path) {
-        Ok(fw_tmp) => {
-          let mut lzma_writer = LzmaWriter::new_compressor(fw_tmp, 9)
-            .map_err(|e| format!("can't initialize compressor: {e}"))?;
-          let mut compressed_size = 0;
-          loop {
-            let read_len = fr
-              .read(&mut f_read_buffer)
-              .map_err(|e| format!("can't read file {src:?}: {e}"))?;
-            if read_len == 0 {
-              break;
-            }
-            compressed_size += lzma_writer
-              .write(&f_read_buffer[0..read_len])
-              .map_err(|e| format!("error while compressing {src:?}: {e}"))?;
-          }
-          lzma_writer
-            .finish()
-            .map_err(|e| format!("can't write compressed data: {e}"))?;
-          Ok(compressed_size)
-        }
-        Err(e) => Err(format!("unable to create {tmp_file_path:?}: {e}"))
-      }
-    }
-    Err(e) => Err(format!("unable to open {src:?}: {e}")),
-  }?;
-  match fs::File::open(tmp_file_path){
-    Ok(mut fr_tmp) => {
-      let mut tmp_read_buffer = [0u8; 4 * 1024 * 1024];
-      loop{
-        let read_len = fr_tmp
-          .read(&mut tmp_read_buffer)
-          .map_err(|e| format!("can't read file {tmp_file_path:?}: {e}"))?;
-        if read_len == 0 {
-          break;
-        }
-      }
-    }
-    Err(e) => Err(format!("unable to open {tmp_file_path:?}: {e}"))
-  }?;
+  file_iter_helpers::compress_file_lzma(src, tmp_file_path, 9)?;
+  let write_len = file_iter_helpers::append_file_contents(tmp_file_path, dst)?;
+  fs::remove_file(tmp_file_path)
+    .map_err(|e| format!("unable to delete {tmp_file_path:?}: {e}"))?;
+  Ok(write_len)
 }
 
 pub fn archive_dir(
@@ -129,16 +91,20 @@ pub fn archive_dir(
   // prefix: &str,
 ) -> Result<(), String> {
   if in_dir.is_dir() {
+    let out_file_name = out_path
+      .file_name()
+      .ok_or(format!("invalid output file name: {out_path:?}"))?
+      .to_str()
+      .ok_or(format!("invalid output file name: {out_path:?}"))?;
     let out_dir = out_path
       .parent()
-      .ok_or(format!("Error getting parent dir of {out_path:?}"))?;
-    fs::create_dir_all(out_dir).map_err(|e| format!("unable to create: {out_dir:?}"))?;
-    let out_path_tmp = PathBuf::from(
-      out_path.to_str()
-        .ok_or("invalid output file path")?.to_string() + ".temp"
-    );
+      .ok_or(format!("error getting parent dir of {out_path:?}"))?;
+    let tmp_dir = out_dir.join(".eseek_temp");
+    fs::create_dir_all(&tmp_dir)
+      .map_err(|e| format!("unable to create: {:?}: {e}", &tmp_dir))?;
+    let out_path_tmp = tmp_dir.join(out_file_name.to_string() + ".temp");
     match fs::File::create(&out_path_tmp) {
-      Ok(mut fwb) => {
+      Ok(fwb) => {
         let mut builder = flatbuffers::FlatBufferBuilder::with_capacity(4 * 1024 * 1024);
         let mut appendix_data = vec![];
         let mut fwb_bw = BufWriter::new(fwb);
@@ -147,17 +113,15 @@ pub fn archive_dir(
           .map_err(|e| format!("can't write to {out_path:?}: {e}"))?;
         let mut current_offset = 16u64;
 
-        for input_entry in
-          ArchiveInputEntryDetails::get_details(PathBuf::from(in_dir), PathBuf::from(""))?.iter()
-        {
+        let archive_input_entries =
+          ArchiveInputEntryDetails::get_details(PathBuf::from(in_dir), PathBuf::from(""))?;
+        for input_entry in archive_input_entries {
           let entry_name_str = input_entry
             .name
             .to_str()
             .ok_or(format!("Invalid file_name: {:?}", &input_entry.name))?;
-          let entry_tmp_path = PathBuf::from(
-            out_dir.to_str().ok_or("invalid output parent path")?.to_string() +
-              &entry_name_str.replace("/", ":").replace("\\", ":")
-          );
+          let entry_tmp_path = tmp_dir
+            .join(entry_name_str.replace("/", ":").replace("\\", ":") + ".temp");
           let entry_name_fb = builder.create_string(entry_name_str);
 
           match input_entry.archive_file_type {
@@ -165,8 +129,7 @@ pub fn archive_dir(
               fwb_bw
                 .write(&[CompressionType::LZMA as u8])
                 .map_err(|e| format!("can't write to {out_path:?}: {e}"))?;
-              println!("processing: {:?}", &input_entry.path);
-              let write_size = compress_and_append(&input_entry.path, &fwb_bw, &entry_tmp_path)?;
+              let write_size = compress_and_append(&input_entry.path, &mut fwb_bw, &entry_tmp_path)?;
 
               appendix_data.push(AppendixEntry::create(
                 &mut builder,
@@ -181,7 +144,7 @@ pub fn archive_dir(
                   name: Some(entry_name_fb),
                 },
               ));
-              current_offset += write_size as u64;
+              current_offset += write_size as u64 + 1u64;
             }
             ArchiveInputEntryType::Folder => {
               appendix_data.push(AppendixEntry::create(
@@ -221,10 +184,14 @@ pub fn archive_dir(
         fwb_bw
           .write(&(compressed_appendix.len() as u64).to_le_bytes())
           .map_err(|e| format!("error writing appendix size: {e}"))?;
-        Ok(())
       }
-      Err(e) => Err(format!("failed opening {out_path_tmp:?}: {e}, skipping it")),
+      Err(e) => return Err(format!("failed opening {out_path_tmp:?}: {e}, skipping it")),
     }
+    fs::rename(&out_path_tmp, out_path)
+      .map_err(|e| format!("error moving temp file to output location: {e}"))?;
+    fs::remove_dir(&tmp_dir)
+      .map_err(|e| format!("error removing temp directory: {e}"))?;
+    Ok(())
   } else {
     Err(format!("{in_dir:?} is not a directory"))
   }
@@ -255,6 +222,51 @@ impl ArchiveEntryDetails{
     }
     Ok(archive_entry_map)
   }
+
+  pub fn extract_to_directory(
+    &self,
+    archive: &mut (impl Read + Seek),
+    out_dir: &Path
+  ) -> Result<(), String> {
+    let entry_path = PathBuf::from(&self.name);
+    if entry_path.is_absolute(){
+      return Err(format!("SECURITY ERROR: absolute path in archive entry"))
+    }
+    let out_file_path = out_dir.join(&self.name);
+    let temp_file_path = out_dir.join(self.name.clone() + ".xz");
+    match self.type_{
+      ArchiveEntryType::File => {
+        let out_file_dir = out_file_path.parent().ok_or(format!("invalid parent dir"))?;
+        fs::create_dir_all(out_file_dir)
+          .map_err(|e| format!("error creating directory {out_file_dir:?}: {e}"))?;
+        file_iter_helpers::extract_file_contents(
+          archive,
+          self.offset + 1,
+          self.size_,
+          &temp_file_path
+        )?;
+        file_iter_helpers::extract_file_lzma(
+          &temp_file_path,
+          &out_file_path
+        )?;
+        fs::remove_file(&temp_file_path)
+          .map_err(|e| format!("error deleting temp file {:?}: {e}", &temp_file_path))?;
+      }
+      ArchiveEntryType::EmptyFile => {
+        let out_file_dir = out_file_path.parent().ok_or(format!("invalid parent dir"))?;
+        fs::create_dir_all(out_file_dir)
+          .map_err(|e| format!("error creating directory {out_file_dir:?}: {e}"))?;
+        fs::File::create(&out_file_path)
+          .map_err(|e| format!("error creating file {out_file_path:?}: {e}"))?;
+      }
+      ArchiveEntryType::EmptyFolder => {
+        fs::create_dir_all(&out_file_path)
+          .map_err(|e| format!("error creating directory {out_file_path:?}: {e}"))?;
+      }
+      _ => {}
+    }
+    Ok(())
+  }
 }
 
 pub fn extract(
@@ -281,9 +293,11 @@ pub fn extract(
       let appendix = appendix_generated::root_as_appendix(&appendix_bytes)
         .map_err(|e| format!("error parsing appendix: {e}"))?;
       let entry_hashmap = ArchiveEntryDetails::hashmap_from_appendix(appendix)?;
-      println!("{:#?}", entry_hashmap);
+      for (_, entry) in entry_hashmap.iter(){
+        entry.extract_to_directory(&mut fr, out_dir)?;
+      }
       Ok(())
     }
-    Err(e) => { Err(format!("failed opening {in_path:?}: {e}")) }
+    Err(e) => Err(format!("failed opening {in_path:?}: {e}"))
   }
 }
